@@ -299,7 +299,7 @@ arfGraph pass@FwdPass { fp_joinFun = joinFun,
                     -- the Body are in the 'DG f n C C'
 -- @ start bodyfun.tex
     body entries blockmap init_fbase
-      = fixpoint2 Fwd joinFun do_block entries blockmap init_fbase
+      = fixpoint Fwd joinFun do_block entries blockmap init_fbase
       where
         do_block :: forall x. Block n C x -> FactBase f
                  -> m (DG f n C x, Fact x f)
@@ -307,15 +307,6 @@ arfGraph pass@FwdPass { fp_joinFun = joinFun,
           where entryFact = case lookupFact (entryLabel b) fb of Just  f -> f
                                                                  Nothing -> undefined
 -- @ end bodyfun.tex
-
-
--- Join all the incoming facts with bottom.
--- We know the results _shouldn't change_, but the transfer
--- functions might, for example, generate some debugging traces.
--- joinInFacts :: DataflowLattice f -> FactBase f -> FactBase f
--- joinInFacts (lattice @ DataflowLattice {fact_bot = bot, fact_join = fj}) fb =
---   mkFactBase lattice $ map botJoin $ mapToList fb
---     where botJoin (l, f) = (l, snd $ fj l (OldFact bot) (NewFact f))
 
 forwardBlockList :: (NonLocal n, LabelsPtr entry)
                  => entry -> Body n -> [Block n C C]
@@ -490,7 +481,7 @@ arbGraph pass@BwdPass { bp_bot  = bottom,
                     -- in the Body; the facts for Labels *in*
                     -- the Body are in the 'DG f n C C'
     body entries blockmap init_fbase
-      = fixpoint2 Bwd joinFun do_block (map entryLabel (backwardBlockList entries blockmap)) blockmap init_fbase
+      = fixpoint Bwd joinFun do_block (map entryLabel (backwardBlockList entries blockmap)) blockmap init_fbase
       where
         do_block :: forall x. Block n C x -> Fact x f -> m (DG f n C x, LabelMap f)
         do_block b f = do (g, f) <- block b f
@@ -544,32 +535,13 @@ distinguishedEntryFact g f = maybe g
 
      -- See Note [TxFactBase invariants]
 
-updateFact :: DataflowLattice f
+updateFact :: JoinFun f
            -> LabelMap (DBlock f n C C)
            -> Label -> f       -- out fact
            -> ([Label], FactBase f)
            -> ([Label], FactBase f)
 -- See Note [TxFactBase change flag]
-updateFact lat newblocks lbl new_fact (cha, fbase)
-  | NoChange <- cha2, lbl `mapMember` newblocks  = (cha,     fbase)
-  | otherwise         = (lbl:cha, mapInsert lbl res_fact fbase)
-  where
-    (cha2, res_fact) -- Note [Unreachable blocks]
-       = case lookupFact lbl fbase of
-           Nothing -> (SomeChange, new_fact_debug)  -- Note [Unreachable blocks]
-           Just old_fact -> join old_fact
-         where join old_fact = 
-                 fact_join lat lbl
-                   (OldFact old_fact) (NewFact new_fact)
-               (_, new_fact_debug) = join (fact_bot lat)
-
-updateFact2 :: JoinFun f
-           -> LabelMap (DBlock f n C C)
-           -> Label -> f       -- out fact
-           -> ([Label], FactBase f)
-           -> ([Label], FactBase f)
--- See Note [TxFactBase change flag]
-updateFact2 joinFun newblocks lbl new_fact (cha, fbase)
+updateFact joinFun newblocks lbl new_fact (cha, fbase)
   | NoChange <- cha2, lbl `mapMember` newblocks  = (cha,     fbase)
   | otherwise         = (lbl:cha, mapInsert lbl res_fact fbase)
   where
@@ -589,67 +561,8 @@ class Monad m => FixpointMonad m where
 
 -- @ start fptype.tex
 data Direction = Fwd | Bwd
+
 fixpoint :: forall m n f. (CheckpointMonad m, NonLocal n)
- => Direction
- -> DataflowLattice f
- -> (Block n C C -> Fact C f -> m (DG f n C C, Fact C f))
- -> [Label]
- -> LabelMap (Block n C C)
- -> (Fact C f -> m (DG f n C C, Fact C f))
--- @ end fptype.tex
--- @ start fpimp.tex
-fixpoint direction lat do_block entries blockmap init_fbase
-  = do
-        -- trace ("fixpoint: " ++ show (case direction of Fwd -> True; Bwd -> False) ++ " " ++ show (mapKeys blockmap) ++ show entries ++ " " ++ show (mapKeys init_fbase)) $ return()
-        (fbase, newblocks) <- loop init_fbase entries mapEmpty
-        -- trace ("fixpoint DONE: " ++ show (mapKeys fbase) ++ show (mapKeys newblocks)) $ return()
-        return (GMany NothingO newblocks NothingO,
-                mapDeleteList (mapKeys blockmap) fbase)
-    -- The successors of the Graph are the the Labels
-    -- for which we have facts and which are *not* in
-    -- the blocks of the graph
-  where
-    -- mapping from L -> Ls.  If the fact for L changes, re-analyse Ls.
-    dep_blocks :: LabelMap [Label]
-    dep_blocks = mapFromListWith (++)
-                        [ (l, [entryLabel b])
-                        | b <- mapElems blockmap
-                        , l <- case direction of
-                                 Fwd -> [entryLabel b]
-                                 Bwd -> successors b
-                        ]
-
-    loop
-       :: FactBase f  -- current factbase (increases monotonically)
-       -> [Label]     -- blocks still to analyse (Todo: use a better rep)
-       -> LabelMap (DBlock f n C C)  -- transformed graph
-       -> m (FactBase f, LabelMap (DBlock f n C C))
-
-    loop fbase []         newblocks = return (fbase, newblocks)
-    loop fbase (lbl:todo) newblocks = do
-      case mapLookup lbl blockmap of
-         Nothing  -> loop fbase todo newblocks
-         Just blk -> do
-           -- trace ("analysing: " ++ show lbl) $ return ()
-           (rg, out_facts) <- do_block blk fbase
-           let (changed, fbase') = mapFoldWithKey
-                                     (updateFact lat newblocks)
-                                     ([],fbase) out_facts
-           -- trace ("fbase': " ++ show (mapKeys fbase')) $ return ()
-           -- trace ("changed: " ++ show changed) $ return ()
-     
-           let to_analyse
-                 = filter (`notElem` todo) $
-                   concatMap (\l -> mapFindWithDefault [] l dep_blocks) changed
-
-           -- trace ("to analyse: " ++ show to_analyse) $ return ()
-
-           let newblocks' = case rg of
-                              GMany _ blks _ -> mapUnion blks newblocks
-     
-           loop fbase' (todo ++ to_analyse) newblocks'
-
-fixpoint2 :: forall m n f. (CheckpointMonad m, NonLocal n)
  => Direction
  -> JoinFun f
  -> (Block n C C -> Fact C f -> m (DG f n C C, Fact C f))
@@ -658,7 +571,7 @@ fixpoint2 :: forall m n f. (CheckpointMonad m, NonLocal n)
  -> (Fact C f -> m (DG f n C C, Fact C f))
 -- @ end fptype.tex
 -- @ start fpimp.tex
-fixpoint2 direction joinFun do_block entries blockmap init_fbase
+fixpoint direction joinFun do_block entries blockmap init_fbase
   = do
         -- trace ("fixpoint: " ++ show (case direction of Fwd -> True; Bwd -> False) ++ " " ++ show (mapKeys blockmap) ++ show entries ++ " " ++ show (mapKeys init_fbase)) $ return()
         (fbase, newblocks) <- loop init_fbase entries mapEmpty
@@ -692,7 +605,7 @@ fixpoint2 direction joinFun do_block entries blockmap init_fbase
            -- trace ("analysing: " ++ show lbl) $ return ()
            (rg, out_facts) <- do_block blk fbase
            let (changed, fbase') = mapFoldWithKey
-                                     (updateFact2 joinFun newblocks)
+                                     (updateFact joinFun newblocks)
                                      ([],fbase) out_facts
            -- trace ("fbase': " ++ show (mapKeys fbase')) $ return ()
            -- trace ("changed: " ++ show changed) $ return ()
